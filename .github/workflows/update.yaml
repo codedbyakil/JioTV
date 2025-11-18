@@ -26,69 +26,79 @@ jobs:
           echo "📥 Fetching Ziotv.json..."
           JSON_URL="https://playify.pages.dev/Ziotv.json"
           JSON=$(curl -sf \
-            -H "User-Agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36" \
+            -H "User-Agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36" \
             -H "Accept: application/json" \
             -H "Referer: https://playify.pages.dev/" \
-            "$JSON_URL") || { echo "❌ Failed to fetch JSON from $JSON_URL"; exit 1; }
+            "$JSON_URL") || { echo "❌ Failed to fetch JSON"; exit 1; }
 
-          # Validate JSON
           if ! echo "$JSON" | jq empty >/dev/null 2>&1; then
-            echo "❌ Invalid or empty JSON"
-            echo "First 200 chars: $(echo "$JSON" | head -c 200)"
+            echo "❌ Invalid JSON"
             exit 1
           fi
 
-          # Start M3U file
           echo "#EXTM3U" > jiotv.m3u
 
-          # Generate entries — safe, quoted, no syntax errors
+          # Robust jq: skip non-objects, handle missing fields
           echo "$JSON" | jq -r '
+            # Ensure top-level is array; if not, wrap it
+            (if type == "array" then . else [.] end) |
+            # Process only objects; skip null/string/number/array items
+            map(select(type == "object")) |
             .[] |
-            # Build #EXTINF line
+            # Optional fields with safe fallbacks
+            (.name // "Unknown") as $name |
+            (.tvg_id // empty) as $tvg_id |
+            (.tvg_logo // empty) as $tvg_logo |
+            (.drmScheme // "") as $drmScheme |
+            (.drmLicense // "") as $drmLicense |
+            (.cookie // "") as $cookie |
+            (.link // "") as $link |
+
+            # Skip entries with no link
+            if ($link | length) == 0 then empty else
+
+            # Build #EXTINF
             "#EXTINF:-1 " +
-            (if has("tvg_id") and (.tvg_id | type == "string") and (.tvg_id | length > 0)
-              then "tvg-id=\"\(.tvg_id)\" " else "" end) +
-            "group-title=\"JioStar\" " +
-            (if has("tvg_logo") and (.tvg_logo | type == "string") and (.tvg_logo | length > 0)
-              then "tvg-logo=\"\(.tvg_logo)\" " else "" end) +
-            ",\(.name // "Unknown")" |
-            # Escape quotes in name (just in case)
-            gsub(","; "\\,") |
+              (if ($tvg_id | length > 0) then "tvg-id=\"\($tvg_id)\" " else "" end) +
+              "group-title=\"JioStar\" " +
+              (if ($tvg_logo | length > 0) then "tvg-logo=\"\($tvg_logo)\" " else "" end) +
+              ",\($name | gsub(","; "\\,"))" |
             . as $extinf |
-            # Build optional DRM lines
-            (if (.drmScheme // "") == "clearkey" and (.drmLicense // "") | test("^[a-fA-F0-9]+:[a-fA-F0-9]+") then
+
+            # Build DRM props (only if valid clearkey license)
+            (if ($drmScheme == "clearkey") and ($drmLicense | test("^[a-zA-Z0-9]+:[a-zA-Z0-9]+")) then
               "#KODIPROP:inputstream.adaptive.license_type=clearkey\n#KODIPROP:inputstream.adaptive.license_key=" + 
-              (.drmLicense | split(":")[0:2] | join(":"))
+              ($drmLicense | split(":")[0:2] | join(":"))
             else "" end) as $drm |
-            # Build UA line
+
             "#EXTVLCOPT:http-user-agent=plaYtv/7.1.5%20(Linux%3BAndroid%2015)%20ExoPlayerLib/2.11.6%20YGX/69.69.69.69" as $ua |
-            # Build cookie line (escape JSON quotes)
-            (if has("cookie") and (.cookie | type == "string") and (.cookie | length > 0) then
-              "#EXTHTTP:{\"cookie\":\"" + (.cookie | gsub("\""; "\\\"")) + "\"}"
-            else "" end) as $cookie |
-            # Final URL
-            (.link // "") as $url |
-            # Assemble all lines (skip empty ones)
+
+            (if ($cookie | length > 0) then
+              "#EXTHTTP:{\"cookie\":\"" + ($cookie | gsub("\""; "\\\"")) + "\"}"
+            else "" end) as $cookie_line |
+
             [
               $extinf,
               ($drm | select(. != "")),
               $ua,
-              ($cookie | select(. != "")),
-              ($url | select(. != ""))
+              ($cookie_line | select(. != "")),
+              $link
             ] | join("\n")
+
+            end
           ' >> jiotv.m3u
 
-          # Final validation
-          if [ ! -s jiotv.m3u ]; then
-            echo "❌ jiotv.m3u is empty!"
+          # Post-check
+          if [ ! -s jiotv.m3u ] || [ "$(wc -l < jiotv.m3u)" -le 1 ]; then
+            echo "❌ jiotv.m3u is empty or only contains #EXTM3U"
             exit 1
           fi
 
-          echo "✅ jiotv.m3u created ($(wc -l < jiotv.m3u) lines, $(wc -c < jiotv.m3u) bytes)"
-          echo "🔎 First channel block:"
-          awk '/^#EXTINF/,/^https?:/ { print; if (/^https?:/) exit }' jiotv.m3u || true
+          echo "✅ jiotv.m3u created ($(wc -l < jiotv.m3u) lines)"
+          echo "🔎 First channel:"
+          awk '/^#EXTINF/,/^https?:/ { print; if (/^https?:/) exit }' jiotv.m3u
 
-      - name: Commit & Push (using GITHUB_TOKEN only)
+      - name: Commit & Push
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
