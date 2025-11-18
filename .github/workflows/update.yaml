@@ -1,7 +1,7 @@
 name: Auto-Update M3U
 
 permissions:
-  contents: write  # Required for push with GITHUB_TOKEN
+  contents: write
 
 on:
   workflow_dispatch:
@@ -24,49 +24,71 @@ jobs:
       - name: Generate jiotv.m3u
         run: |
           echo "📥 Fetching Ziotv.json..."
+          JSON_URL="https://playify.pages.dev/Ziotv.json"
           JSON=$(curl -sf \
-            -H "User-Agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36" \
+            -H "User-Agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36" \
             -H "Accept: application/json" \
             -H "Referer: https://playify.pages.dev/" \
-            "https://playify.pages.dev/Ziotv.json") || { echo "❌ Fetch failed"; exit 1; }
-          
+            "$JSON_URL") || { echo "❌ Failed to fetch JSON from $JSON_URL"; exit 1; }
+
+          # Validate JSON
           if ! echo "$JSON" | jq empty >/dev/null 2>&1; then
-            echo "❌ Invalid JSON"; exit 1
+            echo "❌ Invalid or empty JSON"
+            echo "First 200 chars: $(echo "$JSON" | head -c 200)"
+            exit 1
           fi
-          
+
+          # Start M3U file
           echo "#EXTM3U" > jiotv.m3u
-          
+
+          # Generate entries — safe, quoted, no syntax errors
           echo "$JSON" | jq -r '
             .[] |
-            (
-              "#EXTINF:-1 " +
-              (if .tvg_id then "tvg-id=\"\(.tvg_id)\" " else "" end) +
-              "group-title=\"JioStar\" " +
-              (if .tvg_logo then "tvg-logo=\"\(.tvg_logo)\" " else "" end) +
-              ",\(.name // "Unknown")
-            ) +
-            (
-              if .drmScheme == "clearkey" and .drmLicense then 
-                "\n#KODIPROP:inputstream.adaptive.license_type=clearkey" +
-                "\n#KODIPROP:inputstream.adaptive.license_key=" + (.drmLicense | split(":")[0:2] | join(":"))
-              else "" 
-            end
-            ) +
-            "\n#EXTVLCOPT:http-user-agent=plaYtv/7.1.5%20(Linux%3BAndroid%2015)%20ExoPlayerLib/2.11.6%20YGX/69.69.69.69" +
-            (
-              if .cookie then 
-                "\n#EXTHTTP:{\"cookie\":\"\(.cookie)\"}"
-              else "" 
-            end
-            ) +
-            "\n\(.link // "")"
+            # Build #EXTINF line
+            "#EXTINF:-1 " +
+            (if has("tvg_id") and (.tvg_id | type == "string") and (.tvg_id | length > 0)
+              then "tvg-id=\"\(.tvg_id)\" " else "" end) +
+            "group-title=\"JioStar\" " +
+            (if has("tvg_logo") and (.tvg_logo | type == "string") and (.tvg_logo | length > 0)
+              then "tvg-logo=\"\(.tvg_logo)\" " else "" end) +
+            ",\(.name // "Unknown")" |
+            # Escape quotes in name (just in case)
+            gsub(","; "\\,") |
+            . as $extinf |
+            # Build optional DRM lines
+            (if (.drmScheme // "") == "clearkey" and (.drmLicense // "") | test("^[a-fA-F0-9]+:[a-fA-F0-9]+") then
+              "#KODIPROP:inputstream.adaptive.license_type=clearkey\n#KODIPROP:inputstream.adaptive.license_key=" + 
+              (.drmLicense | split(":")[0:2] | join(":"))
+            else "" end) as $drm |
+            # Build UA line
+            "#EXTVLCOPT:http-user-agent=plaYtv/7.1.5%20(Linux%3BAndroid%2015)%20ExoPlayerLib/2.11.6%20YGX/69.69.69.69" as $ua |
+            # Build cookie line (escape JSON quotes)
+            (if has("cookie") and (.cookie | type == "string") and (.cookie | length > 0) then
+              "#EXTHTTP:{\"cookie\":\"" + (.cookie | gsub("\""; "\\\"")) + "\"}"
+            else "" end) as $cookie |
+            # Final URL
+            (.link // "") as $url |
+            # Assemble all lines (skip empty ones)
+            [
+              $extinf,
+              ($drm | select(. != "")),
+              $ua,
+              ($cookie | select(. != "")),
+              ($url | select(. != ""))
+            ] | join("\n")
           ' >> jiotv.m3u
-          
-          echo "✅ jiotv.m3u created ($(wc -c < jiotv.m3u) bytes)"
-          echo "🔎 Sample (first channel):"
-          awk '/^#EXTINF/,/^https?:/ { print; if (/^https?:/) exit }' jiotv.m3u
 
-      - name: Commit & Push (using GITHUB_TOKEN)
+          # Final validation
+          if [ ! -s jiotv.m3u ]; then
+            echo "❌ jiotv.m3u is empty!"
+            exit 1
+          fi
+
+          echo "✅ jiotv.m3u created ($(wc -l < jiotv.m3u) lines, $(wc -c < jiotv.m3u) bytes)"
+          echo "🔎 First channel block:"
+          awk '/^#EXTINF/,/^https?:/ { print; if (/^https?:/) exit }' jiotv.m3u || true
+
+      - name: Commit & Push (using GITHUB_TOKEN only)
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
