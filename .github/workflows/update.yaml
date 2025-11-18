@@ -26,38 +26,50 @@ jobs:
           echo "📥 Fetching Ziotv.json..."
           JSON_URL="https://playify.pages.dev/Ziotv.json"
           JSON=$(curl -sf \
-            -H "User-Agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36" \
+            -H "User-Agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36" \
             -H "Accept: application/json" \
             -H "Referer: https://playify.pages.dev/" \
             "$JSON_URL") || { echo "❌ Failed to fetch JSON"; exit 1; }
 
-          if ! echo "$JSON" | jq empty >/dev/null 2>&1; then
-            echo "❌ Invalid JSON"
+          if [ -z "$JSON" ] || [ "${JSON:0:1}" = "<" ]; then
+            echo "❌ Response is empty or HTML (e.g., error page)"
+            echo "First 200 chars: $(echo "$JSON" | head -c 200)"
             exit 1
           fi
 
           echo "#EXTM3U" > jiotv.m3u
 
-          # Robust jq: skip non-objects, handle missing fields
+          # Auto-detect structure: array? object with .channels/.data/.list?
           echo "$JSON" | jq -r '
-            # Ensure top-level is array; if not, wrap it
-            (if type == "array" then . else [.] end) |
-            # Process only objects; skip null/string/number/array items
+            # Normalize to array of channels
+            def normalize:
+              if type == "array" then .
+              elif type == "object" then
+                if has("channels") and (.channels | type == "array") then .channels
+                elif has("data") and (.data | type == "array") then .data
+                elif has("list") and (.list | type == "array") then .list
+                elif (.[] | type == "object") then [.[]]  # e.g., { "1": {...}, "2": {...} }
+                else []
+                end
+              else []
+              end;
+
+            normalize |
             map(select(type == "object")) |
             .[] |
-            # Optional fields with safe fallbacks
-            (.name // "Unknown") as $name |
-            (.tvg_id // empty) as $tvg_id |
-            (.tvg_logo // empty) as $tvg_logo |
-            (.drmScheme // "") as $drmScheme |
-            (.drmLicense // "") as $drmLicense |
-            (.cookie // "") as $cookie |
-            (.link // "") as $link |
+            # Extract fields (case-insensitive fallbacks)
+            (.name // .title // .channel_name // "Unknown") as $name |
+            (.tvg_id // .tvgId // .id // "") as $tvg_id |
+            (.tvg_logo // .logo // .icon // "") as $tvg_logo |
+            (.drmScheme // .drm_scheme // .drm // "") as $drmScheme |
+            (.drmLicense // .license // "") as $drmLicense |
+            (.cookie // .cookies // "") as $cookie |
+            # Try common link field names
+            (.link // .url // .stream_url // .hls // .mpd // "") as $link |
 
-            # Skip entries with no link
+            # Skip if no usable link
             if ($link | length) == 0 then empty else
 
-            # Build #EXTINF
             "#EXTINF:-1 " +
               (if ($tvg_id | length > 0) then "tvg-id=\"\($tvg_id)\" " else "" end) +
               "group-title=\"JioStar\" " +
@@ -65,7 +77,6 @@ jobs:
               ",\($name | gsub(","; "\\,"))" |
             . as $extinf |
 
-            # Build DRM props (only if valid clearkey license)
             (if ($drmScheme == "clearkey") and ($drmLicense | test("^[a-zA-Z0-9]+:[a-zA-Z0-9]+")) then
               "#KODIPROP:inputstream.adaptive.license_type=clearkey\n#KODIPROP:inputstream.adaptive.license_key=" + 
               ($drmLicense | split(":")[0:2] | join(":"))
@@ -88,14 +99,19 @@ jobs:
             end
           ' >> jiotv.m3u
 
-          # Post-check
-          if [ ! -s jiotv.m3u ] || [ "$(wc -l < jiotv.m3u)" -le 1 ]; then
-            echo "❌ jiotv.m3u is empty or only contains #EXTM3U"
+          # Final check
+          LINE_COUNT=$(wc -l < jiotv.m3u)
+          if [ "$LINE_COUNT" -le 1 ]; then
+            echo "❌ jiotv.m3u has only #EXTM3U ($LINE_COUNT lines)"
+            echo "🔍 First 10 lines of generated file:"
+            cat jiotv.m3u
+            echo "🔍 Raw JSON first 300 chars:"
+            echo "$JSON" | head -c 300
             exit 1
           fi
 
-          echo "✅ jiotv.m3u created ($(wc -l < jiotv.m3u) lines)"
-          echo "🔎 First channel:"
+          echo "✅ jiotv.m3u created ($LINE_COUNT lines)"
+          echo "📺 First channel:"
           awk '/^#EXTINF/,/^https?:/ { print; if (/^https?:/) exit }' jiotv.m3u
 
       - name: Commit & Push
